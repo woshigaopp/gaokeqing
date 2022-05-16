@@ -1,4 +1,2 @@
 # gaokeqing
-this is gaokeqing's project aaaa
-
-sssss
+更新一些思考 在issues和projects中
