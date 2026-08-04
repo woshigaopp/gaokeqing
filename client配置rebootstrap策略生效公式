@@ -1,0 +1,14 @@
+涉及配置默认值：
+参数
+默认值
+reconnect.backoff.ms
+50ms
+reconnect.backoff.max.ms
+1000ms
+socket.connection.setup.timeout.ms
+10000ms (10s)
+socket.connection.setup.timeout.max.ms
+30000ms (30s)
+N节点Kafka集群生效计算公式：
+$$\boxed{\text{reconnect.backoff.max.ms} > (N-1) \times \text{socket.connection.setup.timeout.max.ms}}$$
+另外 reconnect.backoff.ms 和 socket.connection.setup.timeout.ms 配置成对应max的倍数1/3 或1/2 即可。
