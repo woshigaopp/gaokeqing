@@ -1,0 +1,305 @@
+事实1：client 元数据Metadata更新路径，向哪个节点发起请求，节点的IP地址来自metadata的snapshot。
+"metadata 更新请求发给旧地址"的完整调用栈
+Producer 的调用栈
+1. 触发更新（任何一种方式）:
+   - handleServerDisconnect → metadata.requestUpdate(false)     [NetworkClient.java:1189]
+   - 5分钟过期 → timeToNextUpdate() 返回 0                      [Metadata.java:178]
+   
+2. 进入 maybeUpdate:
+   NetworkClient.poll()                                          [NetworkClient.java:580]
+   └→ metadataUpdater.maybeUpdate(now)                           [NetworkClient.java:593]
+      └→ DefaultMetadataUpdater.maybeUpdate(long now)            [NetworkClient.java:1136]
+         │
+         │  // 检查是否需要更新
+         ├→ metadata.timeToNextUpdate(now)                       [Metadata.java:178]
+         │  └→ updateRequested() ? 0 : (lastSuccessfulRefreshMs + metadataExpireMs - now)
+         │     // 如果 needFullUpdate=true（requestUpdate设置的），返回 0
+         │
+         │  // ★关键：选择发送节点
+         ├→ leastLoadedNode(now)                                 [NetworkClient.java:708]
+         │  └→ this.metadataUpdater.fetchNodes()                 [NetworkClient.java:709]
+         │     └→ metadata.fetch().nodes()                       [NetworkClient.java:1123]
+         │        └→ metadataSnapshot.cluster().nodes()          [Metadata.java:129]
+         │           // ★★★ 这里返回的是 MetadataSnapshot 里的节点列表
+         │           // 如果 MetadataSnapshot 没被 rebootstrap 重置，
+         │           // 里面的节点地址就是上次成功 metadata 更新时拿到的地址（旧IP）
+         │
+         │  // 选中某个旧IP节点后，尝试发送 metadata 请求
+         └→ maybeUpdate(now, node)                               [NetworkClient.java:1240]
+            ├→ canSendRequest(nodeConnectionId, now)             [NetworkClient.java:1241]
+            │  // 旧IP节点没有连接，返回 false
+            ├→ canConnect(node, now)                             [NetworkClient.java:1258]
+            │  // 如果过了 backoff，返回 true
+            └→ initiateConnect(node, now)                        [NetworkClient.java:1261]
+               └→ 向旧IP发起TCP连接
+               └→ 等待 socket.connection.setup.timeout.ms 后超时
+               └→ handleTimedOutConnections                      [NetworkClient.java:889]
+                  └→ processTimeoutDisconnection                 [NetworkClient.java:814]
+                     └→ processDisconnection                     [NetworkClient.java:827]
+                        └→ connectionStates.disconnected(nodeId, now)
+                        └→ metadataUpdater.handleServerDisconnect [NetworkClient.java:862]
+                           └→ metadata.requestUpdate(false)      [NetworkClient.java:1189]
+                           // 又标记需要更新，但下次还是发给旧地址 → 死循环
+AdminClient 的调用栈
+1. 触发更新:
+   - handleServerDisconnect → AdminMetadataManager.requestUpdate()  [AdminMetadataManager.java:119]
+     // state = UPDATE_REQUESTED
+   - 5分钟过期 → metadataFetchDelayMs() 返回 0                      [AdminMetadataManager.java:217]
+
+2. 进入 processRequests 主循环:
+   AdminClientRunnable.processRequests()                             [KafkaAdminClient.java:1512]
+   │
+   ├→ metadataManager.metadataFetchDelayMs(now)                      [KafkaAdminClient.java:1541]
+   │  // state==UPDATE_REQUESTED 时，只需等 delayBeforeNextAttemptMs (retry.backoff.ms, 默认100ms)
+   │  // state==QUIESCENT 时，需等 max(delayBeforeNextAttemptMs, delayBeforeNextExpireMs)
+   │  //   delayBeforeNextExpireMs = metadataExpireMs - (now - lastMetadataUpdateMs)
+   │  //   metadataExpireMs 默认 5分钟
+   │
+   ├→ metadataManager.transitionToUpdatePending(now)                 [KafkaAdminClient.java:1542]
+   │
+   ├→ makeBrokerMetadataCall(now)                                    [KafkaAdminClient.java:1681]
+   │  └→ new Call("fetchMetadata", ..., new MetadataUpdateNodeIdProvider())
+   │
+   ├→ maybeDrainPendingCall(metadataCall, now)                       [KafkaAdminClient.java:1245]
+   │  └→ call.nodeProvider.provide()
+   │     └→ MetadataUpdateNodeIdProvider.provide()                   [KafkaAdminClient.java:720]
+   │        │
+   │        │  // ★关键：选择发送节点
+   │        ├→ client.leastLoadedNode(time.milliseconds())           [KafkaAdminClient.java:721]
+   │        │  └→ this.metadataUpdater.fetchNodes()                  [NetworkClient.java:709]
+   │        │     └→ AdminMetadataUpdater.fetchNodes()               [AdminMetadataManager.java:103]
+   │        │        └→ return cluster.nodes()                       [AdminMetadataManager.java:104]
+   │        │           // ★★★ 这里的 cluster 是 AdminMetadataManager 自己维护的
+   │        │           // 只有两种方式能更新它：
+   │        │           //   1. metadataManager.update(cluster, now)  — metadata fetch 成功时
+   │        │           //   2. metadataManager.rebootstrap(now)     — 重置回 bootstrapCluster
+   │        │           // 如果 metadata fetch 一直失败（旧地址连不上），cluster 永远是旧的
+   │        │
+   │        │  // 选中旧IP节点
+   │        └→ return leastLoadedNode.node()                         [KafkaAdminClient.java:733]
+   │
+   ├→ sendEligibleCalls(now)                                         [KafkaAdminClient.java:1271]
+   │  └→ client.ready(node, now)                                     [KafkaAdminClient.java:1289]
+   │     └→ 向旧IP发起TCP连接
+   │     └→ 等待 socket.connection.setup.timeout.ms 后超时
+   │
+   ├→ client.poll()                                                  [KafkaAdminClient.java:1556]
+   │  └→ handleTimedOutConnections                                   [NetworkClient.java:889]
+   │     └→ processTimeoutDisconnection                              [NetworkClient.java:814]
+   │        └→ processDisconnection                                  [NetworkClient.java:827]
+   │           └→ metadataUpdater.handleServerDisconnect             [NetworkClient.java:862]
+   │              └→ AdminMetadataManager.requestUpdate()            [AdminMetadataManager.java:119]
+   │                 // state = UPDATE_REQUESTED，下一轮又触发 metadata fetch
+   │                 // 但 cluster.nodes() 还是旧的 → 死循环
+   │
+   └→ handleResponses(now, responses)                                [KafkaAdminClient.java:1375]
+      └→ response.wasDisconnected() == true
+         └→ call.fail(now, new DisconnectException(...))             [KafkaAdminClient.java:1411]
+            └→ maybeRetry → pendingCalls.add(this)                   [KafkaAdminClient.java:975]
+            // metadata call 失败，重新加入 pendingCalls
+            // 下一轮 maybeDrainPendingCall → MetadataUpdateNodeIdProvider.provide()
+            // → leastLoadedNode() → 还是旧地址 → 死循环
+关键结论
+无论是 Producer 还是 AdminClient，metadata 更新请求的目标节点都来自各自的"节点列表缓存"：
+- Producer: Metadata.metadataSnapshot.cluster().nodes() — [Metadata.java:129]
+- AdminClient: AdminMetadataManager.cluster.nodes() — [AdminMetadataManager.java:104]
+也即是：client 通过metadata fetch 获取的元数据，是请求其client 中的metadatasnapshot 中记录的IP地址。
+事实2：解析bootstrap server 的时机除了 rebootstrap 路径，只在 client 被 new 的时候调用
+bootstrap() 的调用点：
+1. KafkaProducer 构造函数 → this.metadata.bootstrap(addresses) — [KafkaProducer.java:462]
+2. ClassicKafkaConsumer 构造函数 → this.metadata.bootstrap(addresses) — [ClassicKafkaConsumer.java:190]
+3. AsyncKafkaConsumer 构造函数 → metadata.bootstrap(addresses) — [AsyncKafkaConsumer.java:314]
+4. ShareConsumerImpl 构造函数 → metadata.bootstrap(addresses) — [ShareConsumerImpl.java:263]
+5. WorkerGroupMember 构造函数 → metadata.bootstrap(addresses) — [WorkerGroupMember.java:106]
+6. KafkaAdminClient 构造函数 → metadataManager.update(Cluster.bootstrap(...)) — [KafkaAdminClient.java:551]
+7. Metadata.rebootstrap() → this.bootstrap(this.bootstrapAddresses) — [Metadata.java:315]
+具体路径：
+Producer
+Sender.run()                                          [Sender.java:241]
+  └→ Sender.runOnce()                                 [Sender.java:314]
+      └→ client.poll(pollTimeout, currentTimeMs)      [Sender.java:362]
+          └→ NetworkClient.poll()                     [NetworkClient.java:580]
+              └→ metadataUpdater.maybeUpdate(now)      [NetworkClient.java:593]
+                  └→ DefaultMetadataUpdater.maybeUpdate(long now)  [NetworkClient.java:1136]
+                      ├→ metadata.timeToNextUpdate(now)           [NetworkClient.java:1138]
+                      │   └→ Metadata.timeToNextUpdate()          [Metadata.java:178]
+                      │       (metadataExpireMs=5min 定时触发，或 updateRequested()=true 立即触发)
+                      │
+                      ├→ if (metadataTimeout > 0) return;        [NetworkClient.java:1143]
+                      │   (没到更新时间，直接返回，不检查 rebootstrap)
+                      │
+                      ├→ leastLoadedNode(now)                     [NetworkClient.java:1147]
+                      │   └→ NetworkClient.leastLoadedNode()      [NetworkClient.java:708]
+                      │       (遍历 metadataSnapshot 中的节点列表)
+                      │       (串行限制：foundConnecting/foundCanConnect/foundReady)
+                      │
+                      ├→ 【REBOOTSTRAP 检查点】                   [NetworkClient.java:1150]
+                      │   if (strategy == REBOOTSTRAP && !leastLoadedNode.hasNodeAvailableOrConnectionReady())
+                      │     └→ metadata.rebootstrap()             [Metadata.java:313]
+                      │         └→ log.info("Rebootstrapping with {}", bootstrapAddresses)
+                      │         └→ this.bootstrap(bootstrapAddresses)
+                      │
+                      └→ maybeUpdate(now, node)                   [NetworkClient.java:1240]
+                          ├→ canSendRequest() → 发送 metadata 请求
+                          ├→ isAnyNodeConnecting() → return       [NetworkClient.java:1258]
+                          │   (有节点在连接中，等待，不尝试其他节点)
+                          └→ canConnect() → initiateConnect()     [NetworkClient.java:1264]
+                              (发起到旧 IP 的连接)
+AdminClient 
+AdminClientRunnable.run()                              [KafkaAdminClient.java:1485]
+  └→ processRequests()                                 [KafkaAdminClient.java:1512]
+      │
+      ├→ metadataManager.metadataFetchDelayMs(now)     [KafkaAdminClient.java:1539]
+      │   └→ AdminMetadataManager.metadataFetchDelayMs() [AdminMetadataManager.java:217]
+      │       ├→ QUIESCENT: max(backoff, expireDelay)  (定时 metadata.max.age.ms=5min)
+      │       └→ UPDATE_REQUESTED: backoff only        (disconnect 触发，几乎立即)
+      │
+      ├→ if (metadataFetchDelayMs == 0):               [KafkaAdminClient.java:1540]
+      │   └→ makeMetadataCall(now)                     [KafkaAdminClient.java:1631]
+      │       └→ new Call("describeCluster", ..., new MetadataUpdateNodeIdProvider())
+      │
+      ├→ maybeDrainPendingCalls(now)                   [KafkaAdminClient.java:1537]
+      │   └→ maybeDrainPendingCall(call, now)          [KafkaAdminClient.java:1245]
+      │       └→ call.nodeProvider.provide()           [KafkaAdminClient.java:1249]
+      │           └→ MetadataUpdateNodeIdProvider.provide()  [KafkaAdminClient.java:720]
+      │               ├→ client.leastLoadedNode(now)         [KafkaAdminClient.java:722]
+      │               │   └→ NetworkClient.leastLoadedNode() [NetworkClient.java:708]
+      │               │
+      │               ├→ 【REBOOTSTRAP 检查点】               [KafkaAdminClient.java:723]
+      │               │   if (strategy == REBOOTSTRAP && !leastLoadedNode.hasNodeAvailableOrConnectionReady())
+      │               │     └→ metadataManager.rebootstrap() [AdminMetadataManager.java:301]
+      │               │         └→ log.info("Rebootstrapping with {}", bootstrapCluster)
+      │               │         └→ update(bootstrapCluster, now)
+      │               │
+      │               └→ return leastLoadedNode.node()
+      │
+      ├→ sendEligibleCalls(now)                        [KafkaAdminClient.java:1271]
+      │   └→ client.ready(node, now)                   [NetworkClient.java:311]
+      │       └→ initiateConnect(node, now)            (无 isAnyNodeConnecting 限制，可并行)
+      │
+      └→ client.poll(pollTimeout, now)                 [KafkaAdminClient.java:1560]
+          └→ NetworkClient.poll()                      [NetworkClient.java:580]
+              └→ metadataUpdater.maybeUpdate(now)
+                  └→ AdminMetadataUpdater.maybeUpdate() [AdminMetadataManager.java:113]
+                      └→ return Long.MAX_VALUE          (空实现，什么都不做)
+
+--- disconnect 触发的快速重试循环 ---
+
+NetworkClient.poll()
+  └→ handleDisconnections()                            [NetworkClient.java:1014]
+      └→ processDisconnection()                        [NetworkClient.java:827]
+          └→ metadataUpdater.handleServerDisconnect()
+              └→ AdminMetadataUpdater.handleServerDisconnect() [AdminMetadataManager.java:117]
+                  └→ AdminMetadataManager.requestUpdate()      [AdminMetadataManager.java:195]
+                      └→ state = UPDATE_REQUESTED
+                          (下一轮 processRequests 中 metadataFetchDelayMs ≈ backoff 100ms → 立即触发新的 metadata Call)
+Consumer
+WorkerGroupMember 构造函数                              [WorkerGroupMember.java:80]
+  └→ new NetworkClient(..., metadataRecoveryStrategy)  [WorkerGroupMember.java:108-127]
+      │   (传入 MetadataRecoveryStrategy.REBOOTSTRAP)
+      │
+      └→ NetworkClient 内部使用 DefaultMetadataUpdater
+          (与 Producer 走同一条路径)
+
+ConsumerNetworkClient.poll()
+  └→ client.poll()
+      └→ NetworkClient.poll()                          [NetworkClient.java:580]
+          └→ DefaultMetadataUpdater.maybeUpdate(now)   [NetworkClient.java:1136]
+              └→ (与 Producer 完全相同的调用栈)
+              └→ 【REBOOTSTRAP 检查点】同 Producer      [NetworkClient.java:1150]
+
+关键结论
+重新触发bootstrap server解析的时机，在client 被创建之后，就只能依赖rebootstrap策略的配置生效路径。
+rolling过程的推演（不配置reboot 策略也等同于reboot策略无法触发）
+条件：
+- 3 节点：N1、N2、N3，rolling 顺序 N1 → N2 → N3
+- ASG 模式：stop N1 → ASG 拉起新 N1' → 确认 N1' 健康 → stop N2 → ...
+- 单节点 rolling 耗时约 40-70 秒（从 stop 到新节点健康）
+- rolling 之间不等待，N1' 健康后立刻 stop N2
+- 客户端 MetadataSnapshot 初始包含 {N1旧IP, N2旧IP, N3旧IP}
+- rolling过程中 client 连接未变成idle
+P 指概率
+场景 1：客户端连接在 N1（第一个被 rolling）
+P(初始) = 1/3
+阶段 1：N1 被 stop
+disconnect 事件 → requestUpdate(false) → leastLoadedNode() 从 {N1旧IP, N2旧IP, N3旧IP} 中选。
+N1 在 backoff 中，有效候选是 N2 和 N3，各 50%。无论选中哪个都能连上（都还活着）。
+metadata 请求发给 N2 或 N3 → 响应返回当前集群 broker 列表。
+此时 N1 刚被 stop，新 N1' 还没起来（ASG 刚开始拉起），所以响应里大概率不包含 N1' 的新 IP。响应内容是 {N2旧IP, N3旧IP}（2 个节点）。
+MetadataSnapshot 更新为 {N2旧IP, N3旧IP}。客户端现在与 N2 或 N3 保持连接，正常工作。
+阶段 2：N1' 起来后，立刻 stop N2
+此时客户端连接在 N2 或 N3 上（阶段 1 中 50/50）。
+阶段 2a：客户端连接在 N2 上（P = 1/2）
+N2 被 stop → disconnect → requestUpdate(false) → leastLoadedNode() 从 MetadataSnapshot {N2旧IP, N3旧IP} 中选。
+N2 在 backoff 中，选中 N3 → 连接 N3 → metadata 请求。
+N3 返回的 broker 列表：此时 N1' 已经上线并加入集群，N2 刚被 stop。所以响应是 {N1'新IP, N3旧IP}。
+MetadataSnapshot 更新为 {N1'新IP, N3旧IP}。客户端与 N3 保持连接。
+阶段 3a：N2' 起来后，立刻 stop N3
+客户端连接在 N3 上 → disconnect → leastLoadedNode() 从 {N1'新IP, N3旧IP} 中选。
+N3 在 backoff 中，选中 N1'新IP → 连接 N1' → 成功 → metadata 更新 → ✅ 恢复
+阶段 2b：客户端连接在 N3 上（P = 1/2）
+N2 被 stop → 客户端无感知（没连 N2）。
+但这里有个问题：MetadataSnapshot 是 {N2旧IP, N3旧IP}，客户端连着 N3 正常工作。在 metadata.max.age.ms（5min）到期前不会主动刷新 metadata。
+阶段 3b：N2' 起来后，立刻 stop N3
+客户端连接在 N3 上 → disconnect → leastLoadedNode() 从 MetadataSnapshot {N2旧IP, N3旧IP} 中选。
+N3 在 backoff 中，选中 N2旧IP → 尝试连接 → N2 已经下线了，旧 IP 不可达 → 连接超时 10s。
+10s 后 → 再次 leastLoadedNode()，N2旧IP 现在也在 backoff 中（但 reconnect.backoff.ms 只有 50ms-1s，10s 后早就过了）→ 可能又选中 N2旧IP 或 N3旧IP → 都不可达。
+死循环，无法恢复。
+N1' 和 N2' 此时都已经上线了，它们的新 IP 不在 MetadataSnapshot 里。客户端永远不会尝试连接它们。
+场景 1 汇总：
+- P(走 2a → 3a 路径，恢复) = 1/3 × 1/2 = 1/6
+- P(走 2b → 3b 路径，死循环) = 1/3 × 1/2 = 1/6
+场景 2：客户端连接在 N2（第二个被 rolling）
+P(初始) = 1/3
+阶段 1：N1 被 stop
+客户端连接在 N2，N1 下线无感知。MetadataSnapshot 不变：{N1旧IP, N2旧IP, N3旧IP}。
+阶段 2：N2 被 stop
+disconnect → leastLoadedNode() 从 {N1旧IP, N2旧IP, N3旧IP} 中选。
+N2 在 backoff 中，有效候选是 N1旧IP 和 N3旧IP。
+N1 此时已经下线了（旧 IP 不可达），N3 还活着。
+P(先选中 N3) = 1/2 → 连接 N3 → metadata 请求 → N3 返回 {N1'新IP, N3旧IP} → MetadataSnapshot 更新。
+然后阶段 3：N3 被 stop → disconnect → 从 {N1'新IP, N3旧IP} 选 → 选中 N1'新IP → ✅ 恢复
+P(先选中 N1旧IP) = 1/2 → 连接超时 10s → 再选 → 这次 N1旧IP 和 N3旧IP 都是候选（N1旧IP 的 backoff 50ms-1s 早过了）→ 又是 50/50。
+如果这次选中 N3 → 恢复（同上路径）。累计耗时 ~10s，N3 存活窗口 40-70s，来得及。
+如果又选中 N1旧IP → 又超时 10s → 累计 20s → 再选...
+P(连续 k 次选中 N1旧IP) = (1/2)^k。需要在 N3 存活窗口（~50s）内选中 N3，最多允许 ~4 次超时（40s），P(4 次都选中 N1旧IP) = (1/2)^4 = 6.25%。
+所以 P(阶段 2 成功连上 N3) ≈ 1 - (1/2)^4 ≈ 93.75%
+成功连上 N3 后，阶段 3 同场景 1 的 2a→3a 路径，能恢复。
+场景 2 汇总：
+- P(恢复) ≈ 1/3 × 0.94 ≈ 0.31
+- P(失败) ≈ 1/3 × 0.06 ≈ 0.02
+场景 3：客户端连接在 N3（最后一个被 rolling）
+P(初始) = 1/3
+阶段 1：N1 被 stop → 无感知
+阶段 2：N2 被 stop → 无感知
+阶段 3：N3 被 stop → disconnect
+MetadataSnapshot 还是初始的 {N1旧IP, N2旧IP, N3旧IP}，三个旧 IP 全部不可达。
+leastLoadedNode() 无论选谁都连不上 → ❌ 永远无法恢复
+P(失败) = 1/3
+总概率
+场景
+连接位置
+P(初始)
+P(恢复)
+P(失败)
+1
+N1
+1/3
+1/6 ≈ 16.7%
+1/6 ≈ 16.7%
+2
+N2
+1/3
+~31%
+~2%
+3
+N3
+1/3
+0%
+33.3%
+P(总恢复) ≈ 16.7% + 31% ≈ 48%
+P(总失败) ≈ 16.7% + 2% + 33.3% ≈ 52%
+结论：3 节点集群无等待 rolling，不配置 rebootstrap，客户端恢复概率大约只有一半。 失败的主要来源是场景 3（连接在最后一个节点，1/3 概率必死）和场景 1 的 2b 分支（阶段 2 没有 disconnect，导致 MetadataSnapshot 没更新到新 IP）。
+其他
+rolling过程中 client 连接已变成idle，则只能等待元数据超时，默认5min 这个概率，等于rolling过程中5min 元数据超时概率 * 刚才计算的概率。
+
