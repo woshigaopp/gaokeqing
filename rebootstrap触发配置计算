@@ -1,0 +1,289 @@
+rebootstrap默认配置下无法触发分析
+rebootstrap 触发条件（MetadataUpdateNodeIdProvider.provide()）：
+if (metadataRecoveryStrategy == MetadataRecoveryStrategy.REBOOTSTRAP
+        && !leastLoadedNode.hasNodeAvailableOrConnectionReady()) {
+    metadataManager.rebootstrap(time.milliseconds());
+}
+需要 hasNodeAvailableOrConnectionReady() 返回 false，即 node == null && atLeastOneConnectionReady == false。
+leastLoadedNode() 返回 node == null（即触发 rebootstrap）的条件是：
+所有节点都处于"不可选"（blackout）状态，即每个节点都同时满足以下三个条件：
+1. 连接未就绪（不能发请求）→ canSendRequest = false
+2. 不在连接中 → isPreparingConnection = false（即不在 CONNECTING / CHECKING_API_VERSIONS 状态）
+3. 处于 reconnect backoff 中 → canConnect = false（即 state == DISCONNECTED && now - lastConnectAttemptMs < reconnectBackoffMs）
+每个节点都必须是"断开了，而且还没到可以重试的时间"。
+默认配置下的时间参数：
+参数
+默认值
+reconnect.backoff.ms
+50ms
+reconnect.backoff.max.ms
+1000ms
+socket.connection.setup.timeout.ms
+10000ms (10s)
+socket.connection.setup.timeout.max.ms
+30000ms (30s)
+单个节点的连接生命周期：
+t=0:    canConnect=true → 发起连接 → 进入 CONNECTING 状态
+        此时 isPreparingConnection=true, canConnect=false
+        
+t=0~10s: CONNECTING 状态持续（等待 socket.connection.setup.timeout.ms）
+         leastLoadedNode 走 isPreparingConnection 分支 → foundConnecting = node
+         
+t=10s:  连接超时 → handleTimedOutConnections → processDisconnection
+        → disconnected(nodeId, now):
+          lastConnectAttemptMs = now (t=10s)
+          updateReconnectBackoff → reconnectBackoffMs = backoff(failedAttempts)
+          state = DISCONNECTED
+        
+t=10s ~ 10s+reconnectBackoffMs: DISCONNECTED + blackout
+         canConnect=false, isPreparingConnection=false
+         这是唯一的"不可选"（blackout）窗口
+         
+t=10s+reconnectBackoffMs: canConnect=true → 又可以被选中了
+reconnectBackoffMs 的指数增长（ExponentialBackoff，base=2，jitter=20%）：
+failedAttempts
+reconnectBackoffMs (无 jitter)
+范围 (±20% jitter)
+0
+50ms
+40~60ms
+1
+100ms
+80~120ms
+2
+200ms
+160~240ms
+3
+400ms
+320~480ms
+4
+800ms
+640~960ms
+5+
+1000ms (max)
+800~1000ms
+两个节点的交错时序（稳态，failedAttempts >= 5）：
+reconnectBackoffMs 的值，稳态下是 reconnect.backoff.max.ms（1000ms）加上 ±20% jitter。同理socketConnectingTimeout 的值稳态下是 socket.connection.setup.timeout.max.ms 30s 加上 ±20% jitter。
+Node0: |---CONNECTING 30s---|--blackout 0.8~1.2s--|---CONNECTING 30s---|--blackout--|...
+Node1:          |---CONNECTING 30s---|--blackout 0.8~1.2s--|---CONNECTING 30s---|...
+rebootstrap 需要两个节点的 blackout 窗口完全重叠。如果node0 和 node1 的整个调用时序是完全独立的理论上是存在某个时间窗口blackout 可以重叠。
+重要： 但 AdminClient 是单线程，processRequests 循环中：
+1. maybeDrainPendingCalls → 调用 MetadataUpdateNodeIdProvider.provide() → 调用 leastLoadedNode()
+2. sendEligibleCalls → 对选中的节点调用 client.ready(node, now) → 如果未连接则发起连接 → 节点进入 CONNECTING
+3. client.poll() → 处理连接超时 → handleTimedOutConnections → 节点变成 DISCONNECTED + blackout
+关键：leastLoadedNode() 和 client.ready() 是在同一轮循环中顺序执行的。当 leastLoadedNode() 选中 Node0（canConnect=true）后，sendEligibleCalls 会立刻对 Node0 发起连接，Node0 进入 CONNECTING。下一轮循环时 Node0 是 CONNECTING（isPreparingConnection=true），不是 blackout。
+如图：
+时间轴(秒):  0                   30  31                              61  62
+Node0: |------CONNECTING 30s------|BO~1s|                                  |------CONNECTING 30s------|BO~1s|
+Node1:                            |------CONNECTING 30s------|BO~1s|                                  |------CONNECTING 30s------|
+                                  30                         61    62
+
+Node0 blackout: t=30~31
+Node1 blackout: t=61~62
+间隔: 30s，永远不重叠
+BO = blackout（reconnect backoff）
+逐步解释：
+t=0~30：每次循环，Node0 是 isPreparingConnection=true
+t=30：Node0 连接超时 → DISCONNECTED → blackout ~1s
+t=30：Node1 canConnect=true → 选中 → CONNECTING
+t=30~60：Node1 是 isPreparingConnection=true。Node0 的 blackout 在 t≈31 就结束了
+t=60：Node1 连接超时 → DISCONNECTED → blackout ~1s
+t=60：Node0 早在 t≈31 就结束 blackout，canConnect=true → 选中 → CONNECTING
+关键：两个 node 的 blackout 永远不会重叠。
+结论：在默认配置下，rebootstrap 几乎不可能触发。
+
+Kafka 官方文档里其实暗示了这个问题：
+Consider increasing reconnect.backoff.ms and reconnect.backoff.max.ms and decreasing socket.connection.setup.timeout.ms and socket.connection.setup.timeout.max.ms for the client.
+[图片]
+意思是：要让 rebootstrap 能触发，你需要增大 reconnect backoff（让 blackout 窗口更长）并减小连接超时（让 CONNECTING 状态更短），这样两个节点同时处于 blackout 的概率才会增大。但默认配置下，这个机制基本是废的。
+对比修改配置后如何触发rebootstrap
+核心思路就是：让 blackout 窗口变宽，让 CONNECTING 窗口变窄，这样两个 node 的 blackout 就能重叠。
+默认配置（不可能重叠）：
+Node0: |————————CONNECTING 30s————————|BO 1s|                                          |————————CONNECTING 30s————————|BO 1s|
+Node1:                                |————————CONNECTING 30s————————|BO 1s|                                          |————————CONNECTING 30s————————|
+
+Node0 blackout: t=30~31
+Node1 blackout: t=61~62
+间隔30s，永远不重叠
+如果修改配置：
+{
+  "admin.socket.connection.setup.timeout.ms": "3000",
+  "admin.socket.connection.setup.timeout.max.ms": "5000",
+  "admin.reconnect.backoff.ms": "5000",
+  "admin.reconnect.backoff.max.ms": "15000"
+}
+CONNECTING 稳态 = socket.connection.setup.timeout.max.ms = 5000ms = 5s
+blackout 稳态 = reconnect.backoff.max.ms = 15000ms = 15s
+调优稳态: CONNECTING=5s, blackout=15s
+
+Node0: |CON 5s|————————————blackout 15s————————————|CON 5s|————————————blackout 15s————————————|
+Node1:        |CON 5s|————————————blackout 15s————————————|CON 5s|————————————blackout 15s————————————|
+       0      5     10                              25    30
+Node0 blackout: t=5~20
+Node1 blackout: t=10~25
+重叠区间: t=10~20 (10秒) ✓ 触发rebootstrap
+调整配置的核心逻辑
+调整配置的核心逻辑是 让 blackout时长 > CONNECTING时长，所以需要配置：
+reconnect.backoff.max.ms > socket.connection.setup.timeout.max.ms
+调整配置的副作用
+reconnect.backoff.max.ms 和 reconnect.backoff.ms
+reconnect.backoff.max.ms 和 reconnect.backoff.ms 影响canConnect 方法，canConnect 一共在 4 个地方被调用：
+1. leastLoadedNode() — 选择最空闲节点（影响 rebootstrap 判断）
+2. ready(node, now) — 发送请求前检查：如果节点没连接且 canConnect=true，就发起连接
+3. DefaultMetadataUpdater.maybeUpdate() — metadata 更新时选节点发送 metadata 请求
+4. TelemetrySender — telemetry 发送（不重要）
+reconnect.backoff 的设计本意是避免对一个刚断开的节点立即重连。具体语义：
+节点断开后进入 DISCONNECTED 状态，在 reconnectBackoffMs 时间内处于 blackout，canConnect 返回 false。这段时间内：
+- ready(node) 不会对这个节点发起连接 → 避免对一个可能还没恢复的 broker 疯狂重连
+- leastLoadedNode() 不会选中这个节点 → 跳过它去找别的节点
+- metadata 更新也不会选这个节点
+调大 reconnect.backoff.ms 到 15s 的实际影响：
+对于 AdminClient 来说，因为 AdminClient 的 metadata 里只有 source 集群的 broker 节点（你的场景是 2 个），而且 AdminClient 的操作频率本身就低（定时任务间隔是分钟级）。
+配置加到 admin. 前缀下，它只影响 sourceAdminClient，不影响 task 的 consumer 和 producer。所以：
+- consumer 的重连行为不受影响（consumer 用的是 consumer. 前缀的配置）
+- producer 的重连行为不受影响（producer 用的是 producer. 前缀的配置）
+- 只有 sourceAdminClient 在 broker 正常短暂断开后，要多等几秒才重连
+对于 AdminClient 这种"管理操作"客户端，多等 15s 重连完全无所谓。它本身就是每隔 refresh.topics.interval.seconds（默认 60s）才跑一次 refreshTopicPartitions。
+所以 admin.reconnect.backoff.ms=8000 的副作用在此场景下基本可以忽略。
+socket.connection.setup.timeout.ms 和 socket.connection.setup.timeout.max.ms
+socket.connection.setup.timeout.ms 和 socket.connection.setup.timeout.max.ms 影响的是节点处于 CONNECTING 状态的最大时长。具体调用链：
+NetworkClient.poll() → handleTimedOutConnections() → connectionStates.nodesWithConnectionSetupTimeout(now) → 对每个 CONNECTING 状态的节点检查 isConnectionSetupTimeout(id, now)：
+// ClusterConnectionStates.isConnectionSetupTimeout()
+return now - lastConnectAttemptMs(id) > connectionSetupTimeoutMs(id);
+如果节点在 CONNECTING 状态停留的时间超过 connectionSetupTimeoutMs，就会被强制断开：selector.close(nodeId) → processDisconnection() → connectionStates.disconnected(nodeId, now)，节点进入 DISCONNECTED + blackout。
+connectionSetupTimeoutMs 是每个节点独立维护的值，通过 ExponentialBackoff 指数退避增长：
+// ClusterConnectionStates.updateConnectionSetupTimeout()
+nodeState.failedConnectAttempts++;
+nodeState.connectionSetupTimeoutMs = connectionSetupTimeout.backoff(nodeState.failedConnectAttempts);
+退避公式：random(0.8, 1.2) * socket.connection.setup.timeout.ms * 2^failedConnectAttempts，上限 socket.connection.setup.timeout.max.ms。
+这个值同时还影响 connectionDelay()：当节点处于 CONNECTING 状态时，connectionDelay() 返回 connectionSetupTimeoutMs(id)，这个返回值会影响 NetworkClient.poll() 的超时时间，决定了多久后检查连接是否超时。
+调小 socket.connection.setup.timeout.ms 和 socket.connection.setup.timeout.max.ms 的副作用：
+- 正常场景下，如果 broker 短暂繁忙或网络有抖动，TCP 握手 + TLS 握手可能需要较长时间。调小后可能导致正常连接被误判为超时，断开后重连，增加不必要的连接抖动
+- 跨区域高延迟场景下（如 Connect 集群和 AutoMQ 集群不在同一区域），TCP 三次握手 + TLS 握手的时间可能就要 1-2s，需要留足余量
+- 同样只影响 admin. 前缀下的 sourceAdminClient，不影响 task 的 consumer 和 producer
+N节点集群触发配置公式
+定义
+设 $$T_c = \text{socket.connection.setup.timeout.max.ms}$$（稳态 CONNECTING 时长），$$T_b = \text{reconnect.backoff.max.ms}$$（稳态 blackout 时长），$$N$$ = broker 节点数。
+串行连接前提：DefaultMetadataUpdater.maybeUpdate(now, node) 中 isAnyNodeConnecting() 检查确保同一时刻最多 1 个节点处于 CONNECTING。
+稳态串行轮转模型
+N 个节点依次连接超时，形成固定的轮转序列。每个节点的生命周期：
+$$\text{CONNECTING}(T_c) \rightarrow \text{DISCONNECTED+blackout}(T_b) \rightarrow \text{canConnect=true} \rightarrow \text{CONNECTING}(T_c) \rightarrow \cdots$$
+节点 $$i$$ 进入 blackout 的时刻比节点 $$i-1$$ 晚 $$T_c$$（因为要等节点 $$i-1$$ 的 CONNECTING 超时后才轮到节点 $$i$$）。
+2 节点时序
+Node0: |——CON Tc——|————————blackout Tb————————|——CON Tc——|————————blackout Tb————————|
+Node1:            |——CON Tc——|————————blackout Tb————————|——CON Tc——|————————blackout Tb————————|
+       0          Tc        2Tc      2Tc+Tb              Tc+Tb
+Node0 blackout: $$[T_c,\ T_c + T_b]$$
+Node1 blackout: $$[2T_c,\ 2T_c + T_b]$$
+重叠条件：Node0 的 blackout 结束前，Node1 已进入 blackout：
+$$T_c + T_b > 2T_c$$
+$$\boxed{T_b > T_c}$$
+3 节点时序
+Node0: |——CON Tc——|——————————————blackout Tb——————————————|
+Node1:            |——CON Tc——|——————————————blackout Tb——————————————|
+Node2:                       |——CON Tc——|——————————————blackout Tb——————————————|
+       0          Tc         2Tc        3Tc
+Node0 blackout: $$[T_c,\ T_c + T_b]$$
+Node1 blackout: $$[2T_c,\ 2T_c + T_b]$$
+Node2 blackout: $$[3T_c,\ 3T_c + T_b]$$
+三者交集非空的条件：Node0 的 blackout 结束前，Node2 已进入 blackout：
+$$T_c + T_b > 3T_c$$
+$$\boxed{T_b > 2T_c}$$
+N 节点
+Node 0:   |—CON Tc—|————————————————blackout Tb————————————————|
+Node 1:            |—CON Tc—|————————————————blackout Tb————————————————|
+Node 2:                     |—CON Tc—|————————————————blackout Tb————————————————|
+  ⋮                                  ⋱
+Node N-1:                             |—CON Tc—|————————————————blackout Tb————————————————|
+          0        Tc       2Tc              (N-1)Tc  NTc
+Node 0 blackout: $$[T_c,\ T_c + T_b]$$
+Node $$k$$ blackout: $$[(k+1)T_c,\ (k+1)T_c + T_b]$$
+Node $$N-1$$ blackout: $$[NT_c,\ NT_c + T_b]$$
+所有 N 个节点 blackout 同时重叠的条件：Node 0 的 blackout 结束时刻 > Node N-1 的 blackout 开始时刻：
+$$T_c + T_b > NT_c$$
+$$\boxed{T_b > (N-1) \cdot T_c}$$
+即：
+$$\boxed{\text{reconnect.backoff.max.ms} > (N-1) \times \text{socket.connection.setup.timeout.max.ms}}$$
+重叠窗口大小：
+$$W = T_b - (N-1) \cdot T_c$$
+验证
+N
+条件
+$$T_c=15\text{s},\ T_b=20\text{s}$$
+$$T_c=15\text{s},\ T_b=40\text{s}$$
+2
+$$T_b > T_c$$
+$$20 > 15$$ ✅ ($$W=5\text{s}$$)
+$$40 > 15$$ ✅ ($$W=25\text{s}$$)
+3
+$$T_b > 2T_c$$
+$$20 > 30$$ ❌
+$$40 > 30$$ ✅ ($$W=10\text{s}$$)
+4
+$$T_b > 3T_c$$
+$$20 > 45$$ ❌
+$$40 > 45$$ ❌
+3 节点实例：$$T_b=20\text{s}$$ 为什么不触发
+配置：reconnect.backoff.ms=10s, reconnect.backoff.max.ms=20s, socket.connection.setup.timeout.ms=7s, socket.connection.setup.timeout.max.ms=15s
+（timeout=15s, backoff=20s，稳态）
+t=63      78              93              108
+Node0: |——CON 15s——|————BO 20s————|                |CON...
+Node1:              |——CON 15s——|————BO 20s————|
+Node2:                           |——CON 15s——|————BO 20s————|
+
+Node0 BO: [78, 98]    Node1 BO: [93, 113]    Node2 BO: [108, 128]
+交集 = 空 ❌  (Node0 BO 在 t=98 结束, Node2 BO 到 t=108 才开始)
+永远循环，永远不触发。 因为 $$T_b = 20\text{s} < 2 \times T_c = 30\text{s}$$。
+3 节点实例：$$T_b=40\text{s}$$ 如何触发
+配置改为：reconnect.backoff.max.ms=40s（其余不变）
+（timeout=15s, backoff=40s）✅
+t=63      78              93              108             118
+Node0: |——CON 15s——|————————————————————blackout 40s————————————————————|
+Node1:              |——CON 15s——|————————————————————blackout 40s————————————————————|
+Node2:                           |——CON 15s——|————————————————————blackout 40s————————————————————|
+                                              ↑                        ↑
+                                          t=108                    t=118
+                                     三节点同时 BO          Node0 BO 结束
+
+Node0 BO: [78, 118]    Node1 BO: [93, 133]    Node2 BO: [108, 148]
+交集 = [108, 118] = 10s ✅
+t=108 验证（lastConnectAttemptMs 在 disconnected() 中更新为断开时刻）：
+Node0: now - lastConnectAttemptMs = 108 - 78  = 30s < 40s → canConnect=false ✓
+Node1: now - lastConnectAttemptMs = 108 - 93  = 15s < 40s → canConnect=false ✓
+Node2: now - lastConnectAttemptMs = 108 - 108 =  0s < 40s → canConnect=false ✓
+无节点在 CONNECTING → leastLoadedNode() 返回 null → rebootstrap 触发 ✅
+从首次连接失败到 rebootstrap 触发：约 108s（1 分 48 秒）。
+AdminClient 不受此限制
+AdminClient 走 client.ready(node) → initiateConnect()，无 isAnyNodeConnecting() 检查，可并行连接。N 个节点几乎同时 CONNECTING → 几乎同时超时进入 blackout → 退化为：
+$$T_b > T_c \quad \text{（与 N 无关）}$$
+建议配置
+默认值：
+参数
+默认值
+reconnect.backoff.ms
+50ms
+reconnect.backoff.max.ms
+1000ms
+socket.connection.setup.timeout.ms
+10000ms (10s)
+socket.connection.setup.timeout.max.ms
+30000ms (30s)
+关键在于要让 reconnect.backoff.max.ms > socket.connection.setup.timeout.max.ms
+考虑高延迟场景，尽量保证 client 和 broker 连接不会因为超时时间过小而断开，socket.connection.setup.timeout.max.ms 尽量不缩短太大。
+建议配置为：
+参数
+默认值
+reconnect.backoff.ms
+10000ms(10s)
+reconnect.backoff.max.ms
+40000ms(40s)
+socket.connection.setup.timeout.ms
+7000ms (7s)
+socket.connection.setup.timeout.max.ms
+15000ms (15s)
+{
+  "admin.socket.connection.setup.timeout.ms": "7000",
+  "admin.socket.connection.setup.timeout.max.ms": "15000",
+  "admin.reconnect.backoff.ms": "10000",
+  "admin.reconnect.backoff.max.ms": "40000"
+}
